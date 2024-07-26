@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 aws_endpoint_url = "https://s3.amazonaws.com"
 gcp_endpoint_url = "https://storage.googleapis.com"
+asset_endpoint_url = f"https://api.github.com/repos/ImagingDataCommons/idc-index-data/releases/tags/{idc_index_data.__version__}"
 
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,7 +68,24 @@ class IDCClient:
         self.collection_summary = self.index.groupby("collection_id").agg(
             {"Modality": pd.Series.unique, "series_size_MB": "sum"}
         )
-        self.indices_overview = self.list_indices()
+
+        self.indices_overview = pd.DataFrame(
+            {
+                "index": {"description": None, "installed": True, "url": None},
+                "sm_index": {
+                    "description": None,
+                    "installed": True,
+                    "url": os.path.join(asset_endpoint_url, "sm_index.parquet"),
+                },
+                "sm_instance_index": {
+                    "description": None,
+                    "installed": True,
+                    "url": os.path.join(
+                        asset_endpoint_url, "sm_instance_index.parquet"
+                    ),
+                },
+            }
+        )
 
         # Lookup s5cmd
         self.s5cmdPath = shutil.which("s5cmd")
@@ -172,33 +190,6 @@ class IDCClient:
         idc_version = Version(idc_index_data.__version__).major
         return f"v{idc_version}"
 
-    @staticmethod
-    def _get_latest_idc_index_data_release_assets():
-        """
-        Retrieves a list of the latest idc-index-data release assets.
-
-        Returns:
-            release_assets (list): List of tuples (asset_name, asset_url).
-        """
-        release_assets = []
-        url = f"https://api.github.com/repos/ImagingDataCommons/idc-index-data/releases/tags/{idc_index_data.__version__}"
-        try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 200:
-                release_data = response.json()
-                assets = release_data.get("assets", [])
-                for asset in assets:
-                    release_assets.append(
-                        (asset["name"], asset["browser_download_url"])
-                    )
-            else:
-                logger.error(f"Failed to fetch releases: {response.status_code}")
-
-        except FileNotFoundError:
-            logger.error(f"Failed to fetch releases: {response.status_code}")
-
-        return release_assets
-
     def list_indices(self):
         """
         Lists all available indices including their installation status.
@@ -206,40 +197,6 @@ class IDCClient:
         Returns:
             indices_overview (pd.DataFrame): DataFrame containing information per index.
         """
-
-        if "indices_overview" not in locals():
-            indices_overview = {}
-            # Find installed indices
-            for file in distribution("idc-index-data").files:
-                if str(file).endswith("index.parquet"):
-                    index_name = os.path.splitext(
-                        str(file).rsplit("/", maxsplit=1)[-1]
-                    )[0]
-
-                    indices_overview[index_name] = {
-                        "description": None,
-                        "installed": True,
-                        "local_path": os.path.join(
-                            idc_index_data.IDC_INDEX_PARQUET_FILEPATH.parents[0],
-                            f"{index_name}.parquet",
-                        ),
-                    }
-
-            # Find available indices from idc-index-data
-            release_assets = self._get_latest_idc_index_data_release_assets()
-            for asset_name, asset_url in release_assets:
-                if asset_name.endswith(".parquet"):
-                    asset_name = os.path.splitext(asset_name)[0]
-                    if asset_name not in indices_overview:
-                        indices_overview[asset_name] = {
-                            "description": None,
-                            "installed": False,
-                            "url": asset_url,
-                        }
-
-            self.indices_overview = pd.DataFrame.from_dict(
-                indices_overview, orient="index"
-            )
 
         return self.indices_overview
 
@@ -251,14 +208,14 @@ class IDCClient:
             index (str): Name of the index to be downloaded.
         """
 
-        if index not in self.indices_overview.index.tolist():
+        if index not in self.indices_overview.keys():
             logger.error(f"Index {index} is not available and can not be fetched.")
-        elif self.indices_overview.loc[index, "installed"]:
+        elif self.indices_overview[index]["installed"]:
             logger.warning(
                 f"Index {index} already installed and will not be fetched again."
             )
         else:
-            response = requests.get(self.indices_overview.loc[index, "url"], timeout=30)
+            response = requests.get(self.indices_overview[index]["url"], timeout=30)
             if response.status_code == 200:
                 filepath = os.path.join(
                     idc_index_data.IDC_INDEX_PARQUET_FILEPATH.parents[0],
@@ -266,8 +223,7 @@ class IDCClient:
                 )
                 with open(filepath, mode="wb") as file:
                     file.write(response.content)
-                self.indices_overview.loc[index, "installed"] = True
-                self.indices_overview.loc[index, "local_path"] = filepath
+                self.indices_overview[index]["installed"] = True
             else:
                 logger.error(f"Failed to fetch index: {response.status_code}")
 
@@ -668,8 +624,8 @@ class IDCClient:
         # create a copy of the index
         index_df_copy = self.index
 
-        # Extract s3 url and crdc_instance_uuid from the manifest copy commands
-        # Next, extract crdc_instance_uuid from aws_series_url in the index and
+        # Extract s3 url and crdc_series_uuid from the manifest copy commands
+        # Next, extract crdc_series_uuid from aws_series_url in the index and
         # try to verify if every series in the manifest is present in the index
 
         # TODO: need to remove the assumption that manifest commands will have 'cp'
@@ -697,8 +653,9 @@ class IDCClient:
                 seriesInstanceuid,
                 s3_url,
                 series_size_MB,
-                index_crdc_series_uuid==manifest_crdc_series_uuid AS crdc_series_uuid_match,
+                index_crdc_series_uuid is not NULL as crdc_series_uuid_match,
                 s3_url==series_aws_url AS s3_url_match,
+                manifest_temp.manifest_cp_cmd,
             CASE
                 WHEN s3_url==series_aws_url THEN 'aws'
             ELSE
@@ -717,19 +674,23 @@ class IDCClient:
 
         endpoint_to_use = None
 
-        if validate_manifest:
-            # Check if crdc_instance_uuid is found in the index
-            if not all(merged_df["crdc_series_uuid_match"]):
-                missing_manifest_cp_cmds = merged_df.loc[
-                    ~merged_df["crdc_series_uuid_match"], "manifest_cp_cmd"
-                ]
-                missing_manifest_cp_cmds_str = f"The following manifest copy commands do not have any associated series in the index: {missing_manifest_cp_cmds.tolist()}"
-                raise ValueError(missing_manifest_cp_cmds_str)
+        # Check if any crdc_series_uuid are not found in the index
+        if not all(merged_df["crdc_series_uuid_match"]):
+            missing_manifest_cp_cmds = merged_df.loc[
+                ~merged_df["crdc_series_uuid_match"], "manifest_cp_cmd"
+            ]
+            logger.error(
+                "The following manifest copy commands are not recognized as referencing any associated series in the index.\n"
+                "This means either these commands are invalid, or they may correspond to files available in a release of IDC\n"
+                f"different from {self.get_idc_version()} used in this version of idc-index. The corresponding files will not be downloaded.\n"
+            )
+            logger.error("\n" + "\n".join(missing_manifest_cp_cmds.tolist()))
 
-            # Check if there are more than one endpoints
+        if validate_manifest:
+            # Check if there is more than one endpoint
             if len(merged_df["endpoint"].unique()) > 1:
                 raise ValueError(
-                    "Either GCS bucket path is invalid or manifest has a mix of GCS and AWS urls. If so, please use urls from one provider only"
+                    "Either GCS bucket path is invalid or manifest has a mix of GCS and AWS urls. "
                 )
 
             if (
